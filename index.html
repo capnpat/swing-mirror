@@ -170,7 +170,7 @@
       <input type="checkbox" id="auto-reanchor" checked></div>
     <div class="group"><label>Window</label>
       <input type="range" id="window" min="4" max="40" value="14"><span class="val" id="window-v">14</span></div>
-    <div class="group"><label>Smoothing</label>
+    <div class="group"><label>Steadiness</label>
       <input type="range" id="smooth" min="10" max="100" value="45"><span class="val" id="smooth-v">0.45</span></div>
     <div class="group"><label>Min confidence</label>
       <input type="range" id="minconf" min="0" max="100" value="40"><span class="val" id="minconf-v">0.40</span></div>
@@ -294,8 +294,10 @@ let mirror = true, flipPro = false, mirrorPose = false, autoReanchor = true, sho
 let auto = false, analysing = false;
 
 let proFrames = [];      // [{ t, V, W, lm }]
-let anchor = null, forceGlobal = false, smoothV = null, lastSeekIndex = -1, lastDist = Infinity;
-let WINDOW = 14, SMOOTH = 0.45, MINCONF = 0.40;
+let forceGlobal = false, smoothV = null, posF = null, lostCount = 0, lastSeekT = -1;
+let WINDOW = 14, STEADINESS = 0.45, MINCONF = 0.40;
+const FEAT_EMA = 0.5, DEADBAND = 0.75; // deadband in frames: hold through target wobble smaller than this
+function respMax(){ return Math.max(0.06, Math.min(0.75, 0.7*(1-STEADINESS)+0.06)); }
 
 let currentBlob = null;   // the loaded clip's file/blob, for saving to the library
 let currentMeta = { club:"", view:"", note:"" };
@@ -468,7 +470,7 @@ pro.addEventListener("loadedmetadata", () => {
     trimIn = e.trimIn || 0; trimOut = e.trimOut || (pro.duration||0);
     proFrames = e.frames || [];
     currentBlob = e.blob; currentMeta = { club:e.club, view:e.view, note:e.note||"" };
-    anchor=null; smoothV=null; lastSeekIndex=-1;
+    posF=null; smoothV=null; lostCount=0; lastSeekT=-1;
     autoBtn.disabled = proFrames.length < 2;
     analyseBtn.disabled = false;
     saveClipBtn.disabled = true;
@@ -478,7 +480,7 @@ pro.addEventListener("loadedmetadata", () => {
     seekTo(0); render();
   } else {
     trimIn = 0; trimOut = pro.duration || 0;
-    proFrames = []; anchor = null; setAuto(false);
+    proFrames = []; posF = null; setAuto(false);
     analyseBtn.disabled = false; autoBtn.disabled = true; saveClipBtn.disabled = true;
     clipStatus.textContent = "New clip loaded - click Analyse";
     seekTo(0); render();
@@ -524,7 +526,7 @@ async function analyse(){
     }
     progressBar.style.width = (100*i/total) + "%";
   }
-  proFrames = frames; anchor=null; smoothV=null; lastSeekIndex=-1;
+  proFrames = frames; posF=null; smoothV=null; lostCount=0; lastSeekT=-1;
   progress.style.display = "none"; analyseBtn.disabled = false; analysing = false;
   if(proFrames.length >= 2){
     autoBtn.disabled = false; saveClipBtn.disabled = false;
@@ -538,20 +540,19 @@ async function analyse(){
 analyseBtn.onclick = analyse;
 
 // ---- Matching ------------------------------------------------------------
-function match(v){
-  let gb=-1, gd=Infinity;
-  for(let i=0;i<proFrames.length;i++){ const d=dist(v, proFrames[i]); if(d<gd){ gd=d; gb=i; } }
-  let wb=gb, wd=gd;
-  if(anchor != null){
-    wb=-1; wd=Infinity;
-    const lo=Math.max(0,anchor-WINDOW), hi=Math.min(proFrames.length-1,anchor+WINDOW);
-    for(let i=lo;i<=hi;i++){ const d=dist(v, proFrames[i]); if(d<wd){ wd=d; wb=i; } }
-  }
-  let chosen, cd;
-  if(anchor==null || forceGlobal){ chosen=gb; cd=gd; forceGlobal=false; }
-  else if(autoReanchor && gd < wd*0.55){ chosen=gb; cd=gd; }
-  else { chosen=wb; cd=wd; }
-  lastDist = cd; return chosen;
+function interpTime(pf){
+  const n=proFrames.length; if(n===0) return trimIn;
+  const i0=Math.max(0,Math.min(n-1,Math.floor(pf))), i1=Math.min(n-1,i0+1);
+  const frac=Math.max(0,Math.min(1,pf-i0));
+  return proFrames[i0].t + (proFrames[i1].t - proFrames[i0].t)*frac;
+}
+// Nearest matching frame in [lo,hi]. The output position (posF) is then eased
+// toward this with a deadband, which is what actually smooths the motion; a
+// centroid here would stall on the slow parts of the swing.
+function softTarget(v, lo, hi){
+  let dmin=Infinity, best=lo;
+  for(let i=lo;i<=hi;i++){ const dd=dist(v, proFrames[i]); if(dd<dmin){ dmin=dd; best=i; } }
+  return { tgt: best, dmin };
 }
 function showQuality(q){
   let c,l;
@@ -593,14 +594,28 @@ function liveFrame(){
       const ft = lm ? features(lm) : null;
       if(ft && ft.conf>=MINCONF){
         if(!smoothV || smoothV.length!==ft.V.length) smoothV = ft.V.slice();
-        else for(let i=0;i<smoothV.length;i++) smoothV[i] = SMOOTH*ft.V[i] + (1-SMOOTH)*smoothV[i];
-        const idx = match({ V:smoothV, W:ft.W });
-        if(idx>=0){
-          anchor=idx;
-          if(idx!==lastSeekIndex){ pro.pause(); pro.currentTime=proFrames[idx].t; lastSeekIndex=idx; }
-          drawPose(proCanvas, pro, proStage, proFrames[idx].lm, flipPro);
-          showQuality(Math.sqrt(lastDist)); render();
+        else for(let i=0;i<smoothV.length;i++) smoothV[i] = FEAT_EMA*ft.V[i] + (1-FEAT_EMA)*smoothV[i];
+        const lv = { V:smoothV, W:ft.W };
+        let dmin;
+        if(posF===null || forceGlobal){
+          const r=softTarget(lv, 0, proFrames.length-1); posF=r.tgt; dmin=r.dmin; forceGlobal=false; lostCount=0;
+        } else {
+          const a=Math.round(posF);
+          const lo=Math.max(0,a-WINDOW), hi=Math.min(proFrames.length-1,a+WINDOW);
+          const r=softTarget(lv, lo, hi); dmin=r.dmin;
+          if(autoReanchor && Math.sqrt(dmin)>0.5) lostCount++; else lostCount=0;
+          if(lostCount>18){ const g=softTarget(lv,0,proFrames.length-1); posF=g.tgt; dmin=g.dmin; lostCount=0; }
+          else {
+            const delta = r.tgt - posF;               // deadband: hold still through tracking wobble,
+            if(Math.abs(delta) > DEADBAND)            // follow real movement without lag
+              posF += (delta - Math.sign(delta)*DEADBAND) * respMax();
+          }
         }
+        posF = Math.max(0, Math.min(proFrames.length-1, posF));
+        const t = interpTime(posF);
+        if(Math.abs(t-lastSeekT) > 0.4/fps()){ pro.pause(); pro.currentTime = t; lastSeekT = t; }
+        drawPose(proCanvas, pro, proStage, proFrames[Math.round(posF)].lm, flipPro);
+        showQuality(Math.sqrt(dmin)); render();
       } else showQuality(null);
     }
   }
@@ -614,7 +629,7 @@ function setAuto(on){
   auto = on && proFrames.length>=2;
   autoBtn.classList.toggle("on", auto); autoBtn.textContent = "Auto sync: " + (auto?"on":"off");
   if(!auto){ clearCanvas(proCanvas); showQuality(null); }
-  if(auto){ anchor=null; smoothV=null; forceGlobal=true; }
+  if(auto){ posF=null; smoothV=null; lostCount=0; lastSeekT=-1; forceGlobal=true; }
 }
 autoBtn.onclick = () => setAuto(!auto);
 $("reanchor").onclick = () => { forceGlobal = true; };
@@ -674,7 +689,7 @@ $("auto-reanchor").onchange = e => { autoReanchor=e.target.checked; };
 $("overlays").onchange = e => { showOverlays=e.target.checked; if(!showOverlays){ clearCanvas(liveCanvas); clearCanvas(proCanvas); } };
 const wndR=$("window"), smR=$("smooth"), mcR=$("minconf");
 wndR.oninput=()=>{ WINDOW=+wndR.value; $("window-v").textContent=WINDOW; };
-smR.oninput=()=>{ SMOOTH=+smR.value/100; $("smooth-v").textContent=SMOOTH.toFixed(2); };
+smR.oninput=()=>{ STEADINESS=+smR.value/100; $("smooth-v").textContent=STEADINESS.toFixed(2); };
 mcR.oninput=()=>{ MINCONF=+mcR.value/100; $("minconf-v").textContent=MINCONF.toFixed(2); };
 
 // ---- Help ----------------------------------------------------------------
