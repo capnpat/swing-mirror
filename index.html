@@ -10,25 +10,21 @@
 <meta name="author" content="Patrick Coole">
 <title>Swing Mirror (Auto)</title>
 <!--
-  Swing Mirror v2 - automatic side-by-side golf swing comparison
+  Swing Mirror v3 - automatic side-by-side golf swing comparison
   Author: Patrick Coole
 
-  Left panel:  live camera (iPhone via Continuity Camera).
-  Right panel: a pro swing clip that follows your body automatically.
+  Left panel:  live camera. Right panel: a pro swing clip that follows your body.
 
-  How the auto sync works:
-    1. "Analyse pro" steps through the clip once and records a pose
-       fingerprint for every frame (normalised joint positions).
-    2. The live feed is tracked in real time and turned into the same
-       fingerprint.
-    3. Each live frame is matched to the nearest pro frame, constrained to
-       stay near the previous match so the swing does not jump between
-       look-alike positions (for example address and impact).
+  v3 adds:
+    - A device-stored clip library (IndexedDB): save a clip once with a club and
+      a view tag, along with its cached pose analysis, then pick it instantly.
+    - Confidence-weighted matching: joints the tracker is unsure about are
+      down-weighted, which helps the down-the-line view where limbs overlap.
+    - Joint-angle features: posture (elbow, shoulder, hip, knee angles, spine and
+      arm direction) is matched, not just raw positions.
 
-  Requirements:
-    - Served from http://localhost (or https), not a file:// path, so the
-      camera can be used.
-    - Internet access on first load, to fetch the pose model from the CDN.
+  Runs over https (GitHub Pages) or http://localhost. Needs internet on first
+  load to fetch the pose model from the CDN, then it is cached by the browser.
 -->
 <style>
   :root {
@@ -46,18 +42,21 @@
   #bar .group { display:flex; align-items:center; gap:6px; }
   #bar .group + .group { border-left:1px solid var(--line); padding-left:14px; }
   #bar label { color:var(--muted); }
-  button, select, input[type="number"] { background:#1f242b; color:var(--text);
+  button, select, input[type="number"], input[type="text"] { background:#1f242b; color:var(--text);
     border:1px solid var(--line); border-radius:6px; padding:5px 9px; font-size:13px; cursor:pointer; }
   button:hover { border-color:var(--accent); }
   button:disabled { opacity:.45; cursor:not-allowed; }
   select { max-width:220px; }
   input[type="number"] { width:56px; cursor:text; }
+  input[type="text"] { cursor:text; }
   .toggle.on { border-color:var(--accent); color:var(--accent); }
+  .primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .primary:hover { background:#2f7bf5; }
   .spacer { flex:1; }
 
   #status { display:flex; align-items:center; gap:14px; padding:5px 12px;
     background:#11141a; border-bottom:1px solid var(--line); font-size:12px; color:var(--muted); }
-  #progress { flex:1; height:6px; background:#22272f; border-radius:3px; overflow:hidden; display:none; }
+  #progress { flex:1; height:6px; background:#22272f; border-radius:3px; overflow:hidden; display:none; max-width:320px; }
   #progress > div { height:100%; width:0%; background:var(--accent); }
   .dot { width:9px; height:9px; border-radius:50%; background:#555; display:inline-block; }
   #quality { display:flex; align-items:center; gap:6px; }
@@ -96,19 +95,32 @@
     border-radius:2px; transform:translateX(-50%); }
   #readout { min-width:120px; text-align:right; color:var(--text); font-variant-numeric:tabular-nums; }
 
-  #help { position:absolute; inset:0; z-index:20; display:none; align-items:center; justify-content:center;
+  /* Overlay panels (help + library) */
+  .overlaywrap { position:absolute; inset:0; z-index:20; display:none; align-items:center; justify-content:center;
     background:rgba(0,0,0,.72); }
-  #help.show { display:flex; }
-  #help .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
-    padding:22px 26px; max-width:560px; font-size:14px; line-height:1.55; }
-  #help h2 { margin:0 0 6px; font-size:16px; }
-  #help h3 { margin:16px 0 6px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
-  #help table { width:100%; border-collapse:collapse; }
-  #help td { padding:3px 0; vertical-align:top; }
+  .overlaywrap.show { display:flex; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px;
+    padding:22px 26px; max-width:620px; width:calc(100% - 40px); max-height:85vh; overflow:auto; font-size:14px; line-height:1.55; }
+  .card h2 { margin:0 0 6px; font-size:16px; }
+  .card h3 { margin:16px 0 6px; font-size:13px; color:var(--muted); text-transform:uppercase; letter-spacing:.5px; }
+  .card table { width:100%; border-collapse:collapse; }
+  .card td { padding:3px 0; vertical-align:top; }
   #help td:first-child { color:var(--accent); white-space:nowrap; padding-right:16px; }
   kbd { background:#2a2f37; border:1px solid var(--line); border-bottom-width:2px; border-radius:4px;
     padding:1px 6px; font-size:12px; }
-  #help .close { margin-top:16px; }
+  .rowbtn { margin-top:16px; display:flex; gap:8px; }
+
+  /* Library list */
+  .addrow { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 4px; }
+  .liblist { margin-top:8px; }
+  .libgroup-title { color:var(--accent); font-size:12px; text-transform:uppercase; letter-spacing:.5px; margin:14px 0 4px; }
+  .libitem { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid var(--line);
+    border-radius:8px; margin-bottom:6px; background:#12151b; }
+  .libitem .name { flex:1; }
+  .libitem .meta { color:var(--muted); font-size:12px; }
+  .libitem button { padding:4px 8px; font-size:12px; }
+  .del { border-color:#5a2b2b; color:#ff9a9a; }
+  .empty { color:var(--muted); font-style:italic; }
 </style>
 </head>
 <body>
@@ -126,8 +138,9 @@
     </div>
     <div class="group">
       <label>Pro clip</label>
-      <button id="load-pro">Load video</button>
-      <button id="analyse" disabled title="Scan the clip and build the pose table">Analyse pro</button>
+      <button id="library" class="primary" title="Your saved pro clips by club and view">Library</button>
+      <button id="load-pro" title="Load a new clip from a file">Load new</button>
+      <button id="analyse" disabled title="Scan the clip and build the pose table">Analyse</button>
       <button id="flip-pro" class="toggle" title="Flip the pro display horizontally">Flip</button>
       <label>fps</label>
       <input type="number" id="fps" value="30" min="1" max="240" step="1" title="Frames per second of the pro clip">
@@ -135,11 +148,11 @@
     <div class="group">
       <label>Mode</label>
       <button id="auto" class="toggle" disabled title="Let your body drive the pro clip">Auto sync: off</button>
-      <button id="reanchor" title="Re-find the position from scratch (key: R)">Re-anchor</button>
+      <button id="reanchor" title="Re-find the position (key: R)">Re-anchor</button>
     </div>
     <div class="spacer"></div>
     <button id="adv-btn" title="Matching settings">Settings</button>
-    <button id="help-btn" title="Show controls">? Help</button>
+    <button id="help-btn" title="Show help">? Help</button>
     <input type="file" id="file-input" accept="video/*" hidden>
   </div>
 
@@ -154,19 +167,20 @@
     <div class="group"><label>Mirror pose match</label>
       <input type="checkbox" id="mirror-pose" title="Use when you face the opposite way to the pro clip"></div>
     <div class="group"><label>Auto re-anchor</label>
-      <input type="checkbox" id="auto-reanchor" checked title="Recover automatically if the match is lost"></div>
+      <input type="checkbox" id="auto-reanchor" checked></div>
     <div class="group"><label>Window</label>
       <input type="range" id="window" min="4" max="40" value="14"><span class="val" id="window-v">14</span></div>
     <div class="group"><label>Smoothing</label>
       <input type="range" id="smooth" min="10" max="100" value="45"><span class="val" id="smooth-v">0.45</span></div>
     <div class="group"><label>Min confidence</label>
-      <input type="range" id="minconf" min="0" max="100" value="45"><span class="val" id="minconf-v">0.45</span></div>
+      <input type="range" id="minconf" min="0" max="100" value="40"><span class="val" id="minconf-v">0.40</span></div>
     <div class="group"><label>Overlays</label>
       <input type="checkbox" id="overlays" checked></div>
   </div>
 
   <div id="status">
     <span id="model-status">Model: not loaded</span>
+    <span id="clip-status"></span>
     <div id="progress"><div></div></div>
     <div class="spacer"></div>
     <div id="quality"><span class="dot" id="q-dot"></span><span id="q-text">no match</span></div>
@@ -179,17 +193,17 @@
         <video id="live" class="media" autoplay playsinline muted></video>
         <canvas class="overlay" id="live-canvas"></canvas>
       </div>
-      <div class="hint" id="live-hint">Click <b>Start camera</b>, then pick your iPhone.</div>
+      <div class="hint" id="live-hint">Click <b>Start camera</b>, then pick your iPhone or iPad camera.</div>
     </div>
 
     <div id="divider"></div>
 
     <div class="pane" id="pane-pro">
       <div class="stage" id="pro-stage">
-        <span class="tag">Pro</span>
+        <span class="tag" id="pro-tag">Pro</span>
         <video id="pro" class="media" playsinline muted preload="auto"></video>
         <canvas class="overlay" id="pro-canvas"></canvas>
-        <div class="hint" id="pro-hint">Click <b>Load video</b>, then <b>Analyse pro</b>,<br>then turn on <b>Auto sync</b>.</div>
+        <div class="hint" id="pro-hint">Open <b>Library</b> to pick a saved clip,<br>or <b>Load new</b> to add one.</div>
       </div>
       <div id="scrub">
         <div id="track"><div class="in-out" id="inout"></div><div class="play" id="playhead"></div></div>
@@ -199,31 +213,59 @@
   </div>
 </div>
 
-<div id="help">
+<!-- Help -->
+<div id="help" class="overlaywrap">
   <div class="card">
-    <h2>Swing Mirror (Auto)</h2>
+    <h2>Swing Mirror</h2>
     <h3>Getting started</h3>
     <table>
-      <tr><td>1</td><td>Click <b>Start camera</b> and pick your iPhone. Stand so your whole body is in frame.</td></tr>
-      <tr><td>2</td><td>Click <b>Load video</b> and choose a pro clip filmed from the same angle as you (down-the-line to down-the-line, or face-on to face-on).</td></tr>
-      <tr><td>3</td><td>Set <b>fps</b> to match the clip, then click <b>Analyse pro</b> and wait for the scan.</td></tr>
-      <tr><td>4</td><td>Turn on <b>Auto sync</b>. Move through your swing and the pro follows.</td></tr>
+      <tr><td>1</td><td>Start camera, pick your camera, and stand so your whole body is in frame.</td></tr>
+      <tr><td>2</td><td>Open <b>Library</b> and pick a saved clip, or <b>Load new</b> to add one, set fps, <b>Analyse</b>, then <b>Save to library</b>.</td></tr>
+      <tr><td>3</td><td>Turn on <b>Auto sync</b> and move through your swing.</td></tr>
     </table>
     <h3>Controls</h3>
     <table>
-      <tr><td><kbd>R</kbd></td><td>Re-anchor: re-find the position if the match drifts</td></tr>
-      <tr><td>Wheel / drag / <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>Manual scrub (when Auto sync is off)</td></tr>
+      <tr><td><kbd>R</kbd></td><td>Re-anchor if the match drifts</td></tr>
+      <tr><td>Wheel / drag / <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>Manual scrub (Auto sync off)</td></tr>
       <tr><td><kbd>M</kbd></td><td>Mirror the live view</td></tr>
-      <tr><td>Settings</td><td>Model, mirror-pose (opposite facing), window, smoothing, confidence</td></tr>
-      <tr><td><kbd>?</kbd> / <kbd>H</kbd></td><td>Show or hide this panel</td></tr>
     </table>
-    <h3>If the match is jumpy</h3>
+    <h3>Better sync</h3>
     <table>
-      <tr><td>Facing</td><td>If you face the opposite way to the pro, tick <b>Mirror pose match</b> and re-analyse.</td></tr>
-      <tr><td>Window</td><td>Lower it for tighter tracking, raise it if it cannot keep up with fast moves.</td></tr>
-      <tr><td>Confidence</td><td>Raise it if background or half-body frames confuse the tracker.</td></tr>
+      <tr><td>Angle</td><td>Face-on tracks best. Down-the-line is harder because limbs overlap; manual scrub may suit it better.</td></tr>
+      <tr><td>Clip</td><td>One golfer, whole body, plain background, same angle as you, trimmed to the swing.</td></tr>
+      <tr><td>Model</td><td>Try <b>full</b> in Settings if your device keeps up.</td></tr>
     </table>
-    <button class="close" id="help-close">Close</button>
+    <div class="rowbtn"><button id="help-close">Close</button></div>
+  </div>
+</div>
+
+<!-- Library -->
+<div id="lib" class="overlaywrap">
+  <div class="card">
+    <h2>Clip library</h2>
+    <p class="meta" style="color:var(--muted)">Saved on this device. Each clip keeps its analysis, so it loads instantly.</p>
+
+    <h3>Save the current clip</h3>
+    <div class="addrow">
+      <label>Club</label>
+      <select id="save-club">
+        <option>Driver</option><option>3 Wood</option><option>5 Wood</option><option>Hybrid</option>
+        <option>3 Iron</option><option>4 Iron</option><option>5 Iron</option><option>6 Iron</option>
+        <option>7 Iron</option><option>8 Iron</option><option>9 Iron</option>
+        <option>Pitching Wedge</option><option>Gap Wedge</option><option>Sand Wedge</option><option>Lob Wedge</option>
+        <option>Chipping</option><option>Putting</option>
+      </select>
+      <label>View</label>
+      <select id="save-view"><option value="Face-on">Face-on</option><option value="Down-the-line">Down-the-line</option></select>
+      <input type="text" id="save-note" placeholder="Note (optional), e.g. Rory" style="width:150px">
+      <button id="save-clip" class="primary" disabled>Save to library</button>
+    </div>
+    <p id="save-hint" class="meta" style="color:var(--muted)">Load a clip and Analyse it first, then it can be saved.</p>
+
+    <h3>Saved clips</h3>
+    <div class="liblist" id="lib-list"><span class="empty">No clips saved yet.</span></div>
+
+    <div class="rowbtn"><button id="lib-close">Close</button></div>
   </div>
 </div>
 
@@ -232,131 +274,157 @@ import { FilesetResolver, PoseLandmarker, DrawingUtils }
   from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
 
 "use strict";
+const FEAT_VERSION = 3; // bump when the feature layout changes so old analyses are re-run
 
-// ---- Elements --------------------------------------------------------------
 const $ = id => document.getElementById(id);
 const live = $("live"), pro = $("pro");
 const liveCanvas = $("live-canvas"), proCanvas = $("pro-canvas");
 const liveStage = $("live-stage"), proStage = $("pro-stage");
 const camSelect = $("cam-select"), fpsInput = $("fps");
 const track = $("track"), inout = $("inout"), playhead = $("playhead"), readout = $("readout");
-const proHint = $("pro-hint"), liveHint = $("live-hint");
-const modelStatus = $("model-status"), progress = $("progress"), progressBar = progress.firstElementChild;
+const proHint = $("pro-hint"), liveHint = $("live-hint"), proTag = $("pro-tag");
+const modelStatus = $("model-status"), clipStatus = $("clip-status");
+const progress = $("progress"), progressBar = progress.firstElementChild;
 const qDot = $("q-dot"), qText = $("q-text");
-const autoBtn = $("auto"), analyseBtn = $("analyse");
+const autoBtn = $("auto"), analyseBtn = $("analyse"), saveClipBtn = $("save-clip");
 
-// ---- State -----------------------------------------------------------------
 let stream = null, landmarker = null, modelKey = "full", modelLoading = null;
 let trimIn = 0, trimOut = 0;
 let mirror = true, flipPro = false, mirrorPose = false, autoReanchor = true, showOverlays = true;
 let auto = false, analysing = false;
 
-let proFrames = [];      // [{ t, vec, lm }]
-let anchor = null;       // last matched index into proFrames
-let forceGlobal = false; // one-shot global re-anchor
-let smoothVec = null;    // EMA of the live fingerprint
-let lastSeekIndex = -1;
-let lastDist = Infinity;
+let proFrames = [];      // [{ t, V, W, lm }]
+let anchor = null, forceGlobal = false, smoothV = null, lastSeekIndex = -1, lastDist = Infinity;
+let WINDOW = 14, SMOOTH = 0.45, MINCONF = 0.40;
 
-let WINDOW = 14, SMOOTH = 0.45, MINCONF = 0.45;
+let currentBlob = null;   // the loaded clip's file/blob, for saving to the library
+let currentMeta = { club:"", view:"", note:"" };
 
-// ---- Pose fingerprint ------------------------------------------------------
-// Landmarks used for matching, with per-joint weights (arms and hands matter most).
-const SUBSET = [11,12,13,14,15,16,19,20,23,24,25,26,27,28,0];
-const WSUB = {11:1,12:1,13:1.3,14:1.3,15:1.7,16:1.7,19:1.6,20:1.6,23:1,24:1,25:.8,26:.8,27:.6,28:.6,0:.5};
-let SUMW = 0; SUBSET.forEach(i => SUMW += WSUB[i]);
-// Left/right swap map for mirroring a full 33-landmark pose.
+// ---- Feature model -------------------------------------------------------
+const POS = [11,12,13,14,15,16,19,20,23,24,25,26,27,28,0];
+const POSW = {11:1,12:1,13:1.2,14:1.2,15:1.5,16:1.5,19:1.4,20:1.4,23:1,24:1,25:.8,26:.8,27:.6,28:.6,0:.4};
+const ANG = [ // [a, b(vertex), c, weight]
+  [11,13,15,1.4],[12,14,16,1.4],   // elbows
+  [23,11,13,1.3],[24,12,14,1.3],   // shoulders (arm vs torso)
+  [11,23,25,1.1],[12,24,26,1.1],   // hips
+  [23,25,27,0.8],[24,26,28,0.8]    // knees
+];
+const POS_SCALE = 1.0, ANG_SCALE = 2.6, DIR_SCALE = 2.2;
 const SWAP = {0:0,1:4,2:5,3:6,4:1,5:2,6:3,7:8,8:7,9:10,10:9,11:12,12:11,13:14,14:13,15:16,16:15,
   17:18,18:17,19:20,20:19,21:22,22:21,23:24,24:23,25:26,26:25,27:28,28:27,29:30,30:29,31:32,32:31};
-
-function vis(p){ return (p && p.visibility != null) ? p.visibility : 1; }
-
-function fingerprint(lm){
-  if(!lm || lm.length < 29) return null;
-  const sx=(lm[11].x+lm[12].x)/2, sy=(lm[11].y+lm[12].y)/2;
-  const hx=(lm[23].x+lm[24].x)/2, hy=(lm[23].y+lm[24].y)/2;
-  const torso=Math.hypot(sx-hx, sy-hy);
-  if(torso < 1e-4) return null;
-  const conf = (vis(lm[11])+vis(lm[12])+vis(lm[23])+vis(lm[24])+vis(lm[15])+vis(lm[16]))/6;
-  const vec = [];
-  for(const i of SUBSET){ vec.push((lm[i].x-hx)/torso, (lm[i].y-hy)/torso); }
-  return { vec, conf };
-}
+const vis = p => (p && p.visibility != null) ? p.visibility : 1;
 
 function mirrorLandmarks(lm){
   const out = new Array(lm.length);
-  for(let i=0;i<lm.length;i++){
-    const src = lm[SWAP[i] != null ? SWAP[i] : i];
-    out[i] = { x:1-src.x, y:src.y, z:src.z, visibility:src.visibility };
-  }
+  for(let i=0;i<lm.length;i++){ const s = lm[SWAP[i]!=null?SWAP[i]:i]; out[i] = {x:1-s.x,y:s.y,z:s.z,visibility:s.visibility}; }
   return out;
 }
 
-function dist(a,b){
-  let s=0;
-  for(let j=0;j<SUBSET.length;j++){
-    const w=WSUB[SUBSET[j]], dx=a[2*j]-b[2*j], dy=a[2*j+1]-b[2*j+1];
-    s += w*(dx*dx+dy*dy);
+// Build a flattened value vector V and per-element weight vector W.
+// Weights fold in feature importance and landmark visibility, so joints the
+// tracker cannot see contribute almost nothing to the match.
+function features(lm){
+  if(!lm || lm.length < 29) return null;
+  const sx=(lm[11].x+lm[12].x)/2, sy=(lm[11].y+lm[12].y)/2;
+  const hx=(lm[23].x+lm[24].x)/2, hy=(lm[23].y+lm[24].y)/2;
+  const torso = Math.hypot(sx-hx, sy-hy);
+  if(torso < 1e-4) return null;
+  const conf = (vis(lm[11])+vis(lm[12])+vis(lm[23])+vis(lm[24])+vis(lm[15])+vis(lm[16]))/6;
+  const V = [], W = [];
+  // vis is squared so a joint the tracker is unsure about contributes almost nothing.
+  for(const i of POS){
+    const vv = vis(lm[i]);
+    const w = POSW[i]*vv*vv*POS_SCALE;
+    V.push((lm[i].x-hx)/torso); W.push(w);
+    V.push((lm[i].y-hy)/torso); W.push(w);
   }
-  return s;
+  for(const a of ANG){
+    const [i,j,k,wgt] = a;
+    const v1x=lm[i].x-lm[j].x, v1y=lm[i].y-lm[j].y, v2x=lm[k].x-lm[j].x, v2y=lm[k].y-lm[j].y;
+    const n1=Math.hypot(v1x,v1y)||1e-6, n2=Math.hypot(v2x,v2y)||1e-6;
+    let cos=(v1x*v2x+v1y*v2y)/(n1*n2); cos=Math.max(-1,Math.min(1,cos));
+    const vm=Math.min(vis(lm[i]),vis(lm[j]),vis(lm[k]));
+    V.push(cos); W.push(wgt*vm*vm*ANG_SCALE);
+  }
+  // spine direction (hip -> shoulder)
+  { let dx=sx-hx, dy=sy-hy; const n=Math.hypot(dx,dy)||1e-6; dx/=n; dy/=n;
+    const vm=Math.min(vis(lm[11]),vis(lm[12]),vis(lm[23]),vis(lm[24])); const w=vm*vm*DIR_SCALE;
+    V.push(dx); W.push(w); V.push(dy); W.push(w); }
+  // arm direction (shoulder -> wrists)
+  { const wx=(lm[15].x+lm[16].x)/2, wy=(lm[15].y+lm[16].y)/2;
+    let dx=wx-sx, dy=wy-sy; const n=Math.hypot(dx,dy)||1e-6; dx/=n; dy/=n;
+    const vm=Math.min(vis(lm[15]),vis(lm[16]),vis(lm[11]),vis(lm[12])); const w=vm*vm*DIR_SCALE;
+    V.push(dx); W.push(w); V.push(dy); W.push(w); }
+  return { V, W, conf };
 }
 
-// ---- Model -----------------------------------------------------------------
+// Weighted-mean squared difference; per-element weight is the min of the two,
+// so a joint hidden in either frame is effectively ignored.
+function dist(a, b){
+  const V1=a.V, W1=a.W, V2=b.V, W2=b.W; let s=0, wsum=0;
+  for(let i=0;i<V1.length;i++){
+    const w = Math.min(W1[i], W2[i]); if(w<=0) continue;
+    const d = V1[i]-V2[i]; let d2 = d*d; if(d2>4) d2=4; // cap any single feature's influence
+    s += w*d2; wsum += w;
+  }
+  return wsum>0 ? s/wsum : Infinity;
+}
+
+// ---- Model ---------------------------------------------------------------
 const MODEL_URL = {
   lite:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
   full:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
   heavy:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task"
 };
 let visionFileset = null;
-
 async function ensureModel(){
   if(landmarker) return landmarker;
   if(modelLoading) return modelLoading;
   modelLoading = (async () => {
     modelStatus.textContent = "Model: loading " + modelKey + "...";
     if(!visionFileset){
-      visionFileset = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm");
+      visionFileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm");
     }
     const make = delegate => PoseLandmarker.createFromOptions(visionFileset, {
       baseOptions:{ modelAssetPath: MODEL_URL[modelKey], delegate },
       runningMode:"VIDEO", numPoses:1,
       minPoseDetectionConfidence:0.5, minPosePresenceConfidence:0.5, minTrackingConfidence:0.5
     });
-    try { landmarker = await make("GPU"); }
-    catch(e){ landmarker = await make("CPU"); }
+    try { landmarker = await make("GPU"); } catch(e){ landmarker = await make("CPU"); }
     modelStatus.textContent = "Model: " + modelKey + " ready";
     modelLoading = null;
     return landmarker;
   })().catch(err => {
     modelStatus.textContent = "Model failed to load. Check your internet connection.";
-    modelLoading = null;
-    throw err;
+    modelLoading = null; throw err;
   });
   return modelLoading;
 }
-
-// Monotonic timestamp for detectForVideo (must always increase).
 let lastTs = 0;
 function ts(){ lastTs = Math.max(lastTs+1, Math.round(performance.now())); return lastTs; }
 
-// ---- Camera ----------------------------------------------------------------
+// ---- Camera --------------------------------------------------------------
 async function startCamera(deviceId){
   try {
     if(stream) stream.getTracks().forEach(t => t.stop());
-    const video = deviceId ? { deviceId:{ exact:deviceId } }
-                           : { width:{ ideal:1920 }, height:{ ideal:1080 } };
+    const video = deviceId ? { deviceId:{ exact:deviceId } } : { width:{ideal:1920}, height:{ideal:1080} };
     stream = await navigator.mediaDevices.getUserMedia({ audio:false, video });
-    live.srcObject = stream;
-    liveHint.style.display = "none";
-    await populateCameras();
-    ensureModel().catch(()=>{});
-  } catch(err){
-    liveHint.style.display = "flex";
-    liveHint.innerHTML = "Could not open the camera.<br><span style='font-size:12px'>" +
-      (err && err.message ? err.message : err) +
-      "<br>Serve the page from http://localhost (not a file:// path), and close any app such as QuickTime that is holding the iPhone.</span>";
-  }
+    live.srcObject = stream; liveHint.style.display = "none";
+    await populateCameras(); ensureModel().catch(()=>{});
+  } catch(err){ showCamError(err); }
+}
+async function startCameraFacing(mode){
+  try {
+    if(stream) stream.getTracks().forEach(t => t.stop());
+    stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:{ ideal:mode } } });
+    live.srcObject = stream; liveHint.style.display = "none";
+    await populateCameras(); ensureModel().catch(()=>{});
+  } catch(err){ showCamError(err); }
+}
+function showCamError(err){
+  liveHint.style.display = "flex";
+  liveHint.textContent = "Could not open the camera: " + (err && err.message ? err.message : err) +
+    ". The page must be on https or http://localhost, and no other app may be using the camera.";
 }
 async function populateCameras(){
   try {
@@ -364,210 +432,176 @@ async function populateCameras(){
     const cams = devices.filter(d => d.kind === "videoinput");
     const cur = stream ? stream.getVideoTracks()[0].getSettings().deviceId : camSelect.value;
     camSelect.innerHTML = "";
-    if(cams.length === 0){
-      const o = document.createElement("option");
-      o.textContent = "No cameras found - click Start camera"; o.value = "";
-      camSelect.appendChild(o);
-      return;
-    }
-    let iphone = false;
-    cams.forEach((d,i) => {
-      const o = document.createElement("option");
-      o.value = d.deviceId; o.textContent = d.label || ("Camera " + (i+1));
-      if(d.deviceId === cur) o.selected = true;
-      if(/iphone|continuity|ios/i.test(d.label)) iphone = true;
-      camSelect.appendChild(o);
-    });
-    // Nudge the status line if an iPhone camera has appeared but is not selected.
-    if(iphone && !stream) modelStatus.textContent = "iPhone camera detected. Choose it in the dropdown, then Start camera.";
+    if(!cams.length){ const o=document.createElement("option"); o.textContent="No cameras - click Start camera"; o.value=""; camSelect.appendChild(o); return; }
+    cams.forEach((d,i) => { const o=document.createElement("option"); o.value=d.deviceId; o.textContent=d.label||("Camera "+(i+1)); if(d.deviceId===cur)o.selected=true; camSelect.appendChild(o); });
   } catch(e){}
-}
-// Choose a camera by facing direction (more reliable than device IDs on iPad/iPhone).
-async function startCameraFacing(mode){
-  try {
-    if(stream) stream.getTracks().forEach(t => t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({ audio:false, video:{ facingMode:{ ideal:mode } } });
-    live.srcObject = stream; liveHint.style.display = "none";
-    await populateCameras(); ensureModel().catch(()=>{});
-  } catch(err){
-    liveHint.style.display = "flex";
-    liveHint.textContent = "Could not open the " + (mode==="user"?"front":"rear") +
-      " camera: " + (err && err.message ? err.message : err);
-  }
 }
 $("start-cam").onclick = () => startCamera(camSelect.value || undefined);
 $("cam-front").onclick = () => startCameraFacing("user");
 $("cam-rear").onclick = () => startCameraFacing("environment");
 $("refresh-cams").onclick = () => populateCameras();
 camSelect.onchange = () => { if(camSelect.value) startCamera(camSelect.value); };
-// Re-scan automatically when a camera is plugged in, unplugged, or wakes up.
-if(navigator.mediaDevices && navigator.mediaDevices.addEventListener){
-  navigator.mediaDevices.addEventListener("devicechange", () => populateCameras());
-}
-populateCameras(); // initial list (names appear after camera permission is granted)
-
+if(navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener("devicechange", () => populateCameras());
+populateCameras();
 function applyMirror(){ live.classList.toggle("flipx", mirror); $("mirror").classList.toggle("on", mirror); }
 $("mirror").onclick = () => { mirror = !mirror; applyMirror(); };
 applyMirror();
 
-// ---- Load pro clip ---------------------------------------------------------
+// ---- Pro clip loading ----------------------------------------------------
 const fileInput = $("file-input");
 $("load-pro").onclick = () => fileInput.click();
-fileInput.onchange = () => { const f = fileInput.files[0]; if(f) pro.src = URL.createObjectURL(f); };
+fileInput.onchange = () => {
+  const f = fileInput.files[0]; if(!f) return;
+  currentBlob = f; currentMeta = { club:"", view:"", note:"" };
+  pendingLibrary = null;
+  pro.src = URL.createObjectURL(f);
+  proTag.textContent = "Pro";
+};
 
+let pendingLibrary = null; // set when loading a saved clip, consumed on loadedmetadata
 pro.addEventListener("loadedmetadata", () => {
-  trimIn = 0; trimOut = pro.duration || 0;
-  pro.pause(); proHint.style.display = "none";
-  proFrames = []; anchor = null; setAuto(false);
-  analyseBtn.disabled = false; autoBtn.disabled = true;
-  seekTo(0); render();
+  pro.pause();
+  proHint.style.display = "none";
+  if(pendingLibrary){
+    const e = pendingLibrary; pendingLibrary = null;
+    fpsInput.value = e.fps || 30;
+    trimIn = e.trimIn || 0; trimOut = e.trimOut || (pro.duration||0);
+    proFrames = e.frames || [];
+    currentBlob = e.blob; currentMeta = { club:e.club, view:e.view, note:e.note||"" };
+    anchor=null; smoothV=null; lastSeekIndex=-1;
+    autoBtn.disabled = proFrames.length < 2;
+    analyseBtn.disabled = false;
+    saveClipBtn.disabled = true;
+    proTag.textContent = e.club + " / " + e.view + (e.note ? " ("+e.note+")" : "");
+    clipStatus.textContent = "Loaded: " + proTag.textContent + " - " + proFrames.length + " poses";
+    setAuto(false);
+    seekTo(0); render();
+  } else {
+    trimIn = 0; trimOut = pro.duration || 0;
+    proFrames = []; anchor = null; setAuto(false);
+    analyseBtn.disabled = false; autoBtn.disabled = true; saveClipBtn.disabled = true;
+    clipStatus.textContent = "New clip loaded - click Analyse";
+    seekTo(0); render();
+  }
 });
-
 function applyFlip(){ pro.classList.toggle("flipx", flipPro); $("flip-pro").classList.toggle("on", flipPro); }
 $("flip-pro").onclick = () => { flipPro = !flipPro; applyFlip(); };
 applyFlip();
 
-function fps(){ const v = parseFloat(fpsInput.value); return (isFinite(v) && v>0) ? v : 30; }
+function fps(){ const v=parseFloat(fpsInput.value); return (isFinite(v)&&v>0)?v:30; }
 function clampT(t){ return Math.max(trimIn, Math.min(trimOut, t)); }
 function seekTo(t){ if(pro.src){ pro.pause(); pro.currentTime = clampT(t); } }
 
-// ---- Analyse the pro clip --------------------------------------------------
+// ---- Analyse -------------------------------------------------------------
 const MAX_SAMPLES = 400;
 function seekAndWait(t){
   return new Promise(resolve => {
-    let done = false;
-    const on = () => { if(done) return; done = true; pro.removeEventListener("seeked", on); resolve(); };
-    pro.addEventListener("seeked", on);
-    pro.currentTime = t;
-    setTimeout(on, 400); // fallback if 'seeked' does not fire
+    let done=false; const on=()=>{ if(done)return; done=true; pro.removeEventListener("seeked",on); resolve(); };
+    pro.addEventListener("seeked", on); pro.currentTime = t; setTimeout(on, 400);
   });
 }
 async function analyse(){
   if(!pro.src || analysing) return;
   try { await ensureModel(); } catch(e){ return; }
-  analysing = true;
-  setAuto(false);
-  analyseBtn.disabled = true; autoBtn.disabled = true;
+  analysing = true; setAuto(false);
+  analyseBtn.disabled = true; autoBtn.disabled = true; saveClipBtn.disabled = true;
   progress.style.display = "block"; progressBar.style.width = "0%";
-  modelStatus.textContent = "Analysing pro clip...";
-
+  modelStatus.textContent = "Analysing clip...";
   const f = fps();
-  const total = Math.max(1, Math.floor((trimOut - trimIn) * f));
-  const stride = Math.max(1, Math.ceil(total / MAX_SAMPLES));
+  const total = Math.max(1, Math.floor((trimOut-trimIn)*f));
+  const stride = Math.max(1, Math.ceil(total/MAX_SAMPLES));
   const frames = [];
-  for(let i=0; i<=total; i+=stride){
+  for(let i=0;i<=total;i+=stride){
     const t = clampT(trimIn + i/f);
     await seekAndWait(t);
-    await new Promise(r => requestAnimationFrame(r)); // let the frame paint
-    let res;
-    try { res = landmarker.detectForVideo(pro, ts()); } catch(e){ res = null; }
+    await new Promise(r => requestAnimationFrame(r));
+    let res; try { res = landmarker.detectForVideo(pro, ts()); } catch(e){ res=null; }
     const lm = res && res.landmarks && res.landmarks[0];
     if(lm){
       const use = mirrorPose ? mirrorLandmarks(lm) : lm;
-      const fp = fingerprint(use);
-      if(fp) frames.push({ t, vec:fp.vec, lm: lm }); // store raw lm for drawing
+      const ft = features(use);
+      if(ft) frames.push({ t, V:ft.V, W:ft.W, lm });
     }
-    progressBar.style.width = (100 * i / total) + "%";
+    progressBar.style.width = (100*i/total) + "%";
   }
-  proFrames = frames;
-  anchor = null; smoothVec = null; lastSeekIndex = -1;
-  progress.style.display = "none";
-  analyseBtn.disabled = false;
-  analysing = false;
+  proFrames = frames; anchor=null; smoothV=null; lastSeekIndex=-1;
+  progress.style.display = "none"; analyseBtn.disabled = false; analysing = false;
   if(proFrames.length >= 2){
-    autoBtn.disabled = false;
+    autoBtn.disabled = false; saveClipBtn.disabled = false;
     modelStatus.textContent = "Analysed: " + proFrames.length + " poses. Auto sync ready.";
+    $("save-hint").textContent = "Ready to save this clip to your library.";
   } else {
-    modelStatus.textContent = "Analysis found too few poses. Check the clip shows a full body from a side or front view.";
+    modelStatus.textContent = "Too few poses found. Use a clip with a clear full-body view.";
   }
   seekTo(trimIn); render();
 }
 analyseBtn.onclick = analyse;
 
-// ---- Matching --------------------------------------------------------------
+// ---- Matching ------------------------------------------------------------
 function match(v){
-  // global best (cheap, and used for recovery / first anchor)
   let gb=-1, gd=Infinity;
-  for(let i=0;i<proFrames.length;i++){ const d=dist(v, proFrames[i].vec); if(d<gd){ gd=d; gb=i; } }
-  // windowed best around the current anchor
+  for(let i=0;i<proFrames.length;i++){ const d=dist(v, proFrames[i]); if(d<gd){ gd=d; gb=i; } }
   let wb=gb, wd=gd;
   if(anchor != null){
     wb=-1; wd=Infinity;
-    const lo=Math.max(0, anchor-WINDOW), hi=Math.min(proFrames.length-1, anchor+WINDOW);
-    for(let i=lo;i<=hi;i++){ const d=dist(v, proFrames[i].vec); if(d<wd){ wd=d; wb=i; } }
+    const lo=Math.max(0,anchor-WINDOW), hi=Math.min(proFrames.length-1,anchor+WINDOW);
+    for(let i=lo;i<=hi;i++){ const d=dist(v, proFrames[i]); if(d<wd){ wd=d; wb=i; } }
   }
   let chosen, cd;
-  if(anchor == null || forceGlobal){ chosen=gb; cd=gd; forceGlobal=false; }
-  else if(autoReanchor && gd < wd*0.55){ chosen=gb; cd=gd; }   // jump only if clearly better
+  if(anchor==null || forceGlobal){ chosen=gb; cd=gd; forceGlobal=false; }
+  else if(autoReanchor && gd < wd*0.55){ chosen=gb; cd=gd; }
   else { chosen=wb; cd=wd; }
-  lastDist = cd;
-  return chosen;
+  lastDist = cd; return chosen;
 }
-function quality(cd){ return Math.sqrt(cd / SUMW); } // ~ per-joint offset in torso units
 function showQuality(q){
-  let c, label;
-  if(q == null){ c="#555"; label="no match"; }
-  else if(q < 0.14){ c="var(--good)"; label="good"; }
-  else if(q < 0.28){ c="var(--warn)"; label="fair"; }
-  else { c="var(--bad)"; label="poor"; }
-  qDot.style.background = c; qText.textContent = label;
+  let c,l;
+  if(q==null){ c="#555"; l="no match"; }
+  else if(q<0.16){ c="var(--good)"; l="good"; }
+  else if(q<0.32){ c="var(--warn)"; l="fair"; }
+  else { c="var(--bad)"; l="poor"; }
+  qDot.style.background=c; qText.textContent=l;
 }
 
-// ---- Overlays --------------------------------------------------------------
+// ---- Overlays ------------------------------------------------------------
 function contentRect(video, stage){
-  const cw=stage.clientWidth, ch=stage.clientHeight;
-  const vw=video.videoWidth||cw, vh=video.videoHeight||ch;
-  const s=Math.min(cw/vw, ch/vh);
-  const w=vw*s, h=vh*s;
+  const cw=stage.clientWidth, ch=stage.clientHeight, vw=video.videoWidth||cw, vh=video.videoHeight||ch;
+  const s=Math.min(cw/vw, ch/vh), w=vw*s, h=vh*s;
   return { left:(cw-w)/2, top:(ch-h)/2, w, h };
 }
 function drawPose(canvas, video, stage, lm, flip){
-  const r = contentRect(video, stage);
-  canvas.style.left=r.left+"px"; canvas.style.top=r.top+"px";
-  canvas.style.width=r.w+"px"; canvas.style.height=r.h+"px";
+  const r=contentRect(video, stage);
+  canvas.style.left=r.left+"px"; canvas.style.top=r.top+"px"; canvas.style.width=r.w+"px"; canvas.style.height=r.h+"px";
   canvas.width=Math.max(1,Math.round(r.w)); canvas.height=Math.max(1,Math.round(r.h));
-  const ctx=canvas.getContext("2d");
-  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const ctx=canvas.getContext("2d"); ctx.clearRect(0,0,canvas.width,canvas.height);
   if(!lm || !showOverlays) return;
-  ctx.save();
-  if(flip){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
+  ctx.save(); if(flip){ ctx.translate(canvas.width,0); ctx.scale(-1,1); }
   const du=new DrawingUtils(ctx);
   du.drawConnectors(lm, PoseLandmarker.POSE_CONNECTIONS, { color:"rgba(79,157,255,.9)", lineWidth:3 });
   du.drawLandmarks(lm, { radius:3, color:"#ffd24a", fillColor:"#ffd24a" });
   ctx.restore();
 }
-function clearCanvas(canvas){ const c=canvas.getContext("2d"); c.clearRect(0,0,canvas.width,canvas.height); }
-function proIndexForTime(t){
-  if(!proFrames.length) return -1;
-  let best=0, bd=Infinity;
-  for(let i=0;i<proFrames.length;i++){ const d=Math.abs(proFrames[i].t-t); if(d<bd){ bd=d; best=i; } }
-  return best;
-}
+function clearCanvas(c){ const x=c.getContext("2d"); x.clearRect(0,0,c.width,c.height); }
+function proIndexForTime(t){ let b=0,bd=Infinity; for(let i=0;i<proFrames.length;i++){ const d=Math.abs(proFrames[i].t-t); if(d<bd){bd=d;b=i;} } return proFrames.length?b:-1; }
 
-// ---- Live loop -------------------------------------------------------------
+// ---- Live loop -----------------------------------------------------------
 function liveFrame(){
-  if(landmarker && stream && live.readyState >= 2 && !analysing){
-    let res=null;
-    try { res = landmarker.detectForVideo(live, ts()); } catch(e){}
+  if(landmarker && stream && live.readyState>=2 && !analysing){
+    let res=null; try { res=landmarker.detectForVideo(live, ts()); } catch(e){}
     const lm = res && res.landmarks && res.landmarks[0];
     drawPose(liveCanvas, live, liveStage, lm, mirror);
-
-    if(auto && proFrames.length >= 2){
-      const fp = lm ? fingerprint(lm) : null;
-      if(fp && fp.conf >= MINCONF){
-        if(!smoothVec) smoothVec = fp.vec.slice();
-        else for(let i=0;i<smoothVec.length;i++) smoothVec[i] = SMOOTH*fp.vec[i] + (1-SMOOTH)*smoothVec[i];
-        const idx = match(smoothVec);
-        if(idx >= 0){
-          anchor = idx;
-          if(idx !== lastSeekIndex){ pro.pause(); pro.currentTime = proFrames[idx].t; lastSeekIndex = idx; }
+    if(auto && proFrames.length>=2){
+      const ft = lm ? features(lm) : null;
+      if(ft && ft.conf>=MINCONF){
+        if(!smoothV || smoothV.length!==ft.V.length) smoothV = ft.V.slice();
+        else for(let i=0;i<smoothV.length;i++) smoothV[i] = SMOOTH*ft.V[i] + (1-SMOOTH)*smoothV[i];
+        const idx = match({ V:smoothV, W:ft.W });
+        if(idx>=0){
+          anchor=idx;
+          if(idx!==lastSeekIndex){ pro.pause(); pro.currentTime=proFrames[idx].t; lastSeekIndex=idx; }
           drawPose(proCanvas, pro, proStage, proFrames[idx].lm, flipPro);
-          showQuality(quality(lastDist));
-          render();
+          showQuality(Math.sqrt(lastDist)); render();
         }
-      } else {
-        showQuality(null); // holding: body not confidently visible
-      }
+      } else showQuality(null);
     }
   }
   if("requestVideoFrameCallback" in HTMLVideoElement.prototype) live.requestVideoFrameCallback(liveFrame);
@@ -576,118 +610,179 @@ function liveFrame(){
 if("requestVideoFrameCallback" in HTMLVideoElement.prototype) live.requestVideoFrameCallback(liveFrame);
 else requestAnimationFrame(liveFrame);
 
-// ---- Auto toggle -----------------------------------------------------------
 function setAuto(on){
-  auto = on && proFrames.length >= 2;
-  autoBtn.classList.toggle("on", auto);
-  autoBtn.textContent = "Auto sync: " + (auto ? "on" : "off");
+  auto = on && proFrames.length>=2;
+  autoBtn.classList.toggle("on", auto); autoBtn.textContent = "Auto sync: " + (auto?"on":"off");
   if(!auto){ clearCanvas(proCanvas); showQuality(null); }
-  if(auto){ anchor = null; smoothVec = null; forceGlobal = true; }
+  if(auto){ anchor=null; smoothV=null; forceGlobal=true; }
 }
 autoBtn.onclick = () => setAuto(!auto);
 $("reanchor").onclick = () => { forceGlobal = true; };
 
-// ---- Manual scrub (only when Auto is off) ----------------------------------
+// ---- Manual scrub --------------------------------------------------------
 function nudge(fr){ if(!auto) seekTo(pro.currentTime + fr/fps()); }
 proStage.addEventListener("wheel", e => {
-  if(auto || !pro.src) return;
-  e.preventDefault();
-  const d = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
-  nudge((d>0?1:-1) * (Math.abs(d)>40?2:1));
+  if(auto || !pro.src) return; e.preventDefault();
+  const d = Math.abs(e.deltaY)>=Math.abs(e.deltaX)?e.deltaY:e.deltaX;
+  nudge((d>0?1:-1)*(Math.abs(d)>40?2:1));
 }, { passive:false });
-let dragging=false, lastX=0;
-proStage.addEventListener("pointerdown", e => { if(auto||!pro.src) return; dragging=true; lastX=e.clientX; proStage.setPointerCapture(e.pointerId); });
-proStage.addEventListener("pointermove", e => {
-  if(!dragging) return;
-  const dx=e.clientX-lastX; lastX=e.clientX;
-  const range=Math.max(0.001, trimOut-trimIn);
-  seekTo(pro.currentTime + dx * (range/(proStage.clientWidth*1.5)));
-});
-const endDrag=()=>{ dragging=false; };
-proStage.addEventListener("pointerup", endDrag);
-proStage.addEventListener("pointercancel", endDrag);
-
-function seekFromTrack(e){
-  if(!pro.src) return;
-  const r=track.getBoundingClientRect();
-  const frac=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));
-  seekTo(trimIn + frac*(trimOut-trimIn));
-}
+let dragging=false,lastX=0;
+proStage.addEventListener("pointerdown", e => { if(auto||!pro.src)return; dragging=true; lastX=e.clientX; proStage.setPointerCapture(e.pointerId); });
+proStage.addEventListener("pointermove", e => { if(!dragging)return; const dx=e.clientX-lastX; lastX=e.clientX; const range=Math.max(0.001,trimOut-trimIn); seekTo(pro.currentTime + dx*(range/(proStage.clientWidth*1.5))); });
+const endDrag=()=>{dragging=false;}; proStage.addEventListener("pointerup",endDrag); proStage.addEventListener("pointercancel",endDrag);
+function seekFromTrack(e){ if(!pro.src)return; const r=track.getBoundingClientRect(); const frac=Math.max(0,Math.min(1,(e.clientX-r.left)/r.width)); seekTo(trimIn+frac*(trimOut-trimIn)); }
 let trackDrag=false;
-track.addEventListener("pointerdown", e => { if(auto) return; trackDrag=true; track.setPointerCapture(e.pointerId); seekFromTrack(e); });
+track.addEventListener("pointerdown", e => { if(auto)return; trackDrag=true; track.setPointerCapture(e.pointerId); seekFromTrack(e); });
 track.addEventListener("pointermove", e => { if(trackDrag) seekFromTrack(e); });
 track.addEventListener("pointerup", () => { trackDrag=false; });
+pro.addEventListener("seeked", () => { render(); if(!auto && proFrames.length){ const idx=proIndexForTime(pro.currentTime); if(idx>=0) drawPose(proCanvas, pro, proStage, proFrames[idx].lm, flipPro); } });
 
-// Draw the pro skeleton at the manually-scrubbed position, if analysed.
-pro.addEventListener("seeked", () => {
-  render();
-  if(!auto && proFrames.length){
-    const idx=proIndexForTime(pro.currentTime);
-    if(idx>=0) drawPose(proCanvas, pro, proStage, proFrames[idx].lm, flipPro);
-  }
-});
-
-// ---- Keyboard --------------------------------------------------------------
 document.addEventListener("keydown", e => {
-  const tag=(e.target.tagName||"").toLowerCase();
-  if(tag==="input"||tag==="select") return;
+  const tag=(e.target.tagName||"").toLowerCase(); if(tag==="input"||tag==="select") return;
   switch(e.key){
-    case "ArrowLeft": if(!auto){ e.preventDefault(); nudge(e.shiftKey?-10:-1); } break;
-    case "ArrowRight": if(!auto){ e.preventDefault(); nudge(e.shiftKey?10:1); } break;
-    case "Home": if(!auto){ e.preventDefault(); seekTo(trimIn); } break;
-    case "End": if(!auto){ e.preventDefault(); seekTo(trimOut); } break;
-    case "r": case "R": forceGlobal = true; break;
+    case "ArrowLeft": if(!auto){ e.preventDefault(); nudge(e.shiftKey?-10:-1);} break;
+    case "ArrowRight": if(!auto){ e.preventDefault(); nudge(e.shiftKey?10:1);} break;
+    case "Home": if(!auto){ e.preventDefault(); seekTo(trimIn);} break;
+    case "End": if(!auto){ e.preventDefault(); seekTo(trimOut);} break;
+    case "r": case "R": forceGlobal=true; break;
     case "m": case "M": mirror=!mirror; applyMirror(); break;
     case "h": case "H": case "?": $("help").classList.toggle("show"); break;
-    case "Escape": $("help").classList.remove("show"); break;
+    case "Escape": $("help").classList.remove("show"); $("lib").classList.remove("show"); break;
   }
 });
 
-// ---- Readout ---------------------------------------------------------------
 function render(){
   const dur=pro.duration||0, range=trimOut-trimIn;
-  const relFrame=Math.round((pro.currentTime-trimIn)*fps());
-  const totFrames=Math.round(range*fps());
-  readout.textContent = "frame " + Math.max(0,relFrame) + " / " + Math.max(0,totFrames);
-  if(dur>0){
-    inout.style.left=(100*trimIn/dur)+"%";
-    inout.style.width=(100*range/dur)+"%";
-    playhead.style.left=(100*pro.currentTime/dur)+"%";
-  }
+  readout.textContent = "frame " + Math.max(0,Math.round((pro.currentTime-trimIn)*fps())) + " / " + Math.max(0,Math.round(range*fps()));
+  if(dur>0){ inout.style.left=(100*trimIn/dur)+"%"; inout.style.width=(100*range/dur)+"%"; playhead.style.left=(100*pro.currentTime/dur)+"%"; }
 }
 
-// ---- Divider ---------------------------------------------------------------
+// ---- Divider -------------------------------------------------------------
 const divider=$("divider"), split=$("split"), paneLive=$("pane-live"), panePro=$("pane-pro");
 let divDrag=false;
 divider.addEventListener("pointerdown", e => { divDrag=true; divider.setPointerCapture(e.pointerId); });
-divider.addEventListener("pointermove", e => {
-  if(!divDrag) return;
-  const r=split.getBoundingClientRect();
-  const frac=Math.max(0.2,Math.min(0.8,(e.clientX-r.left)/r.width));
-  paneLive.style.flex="0 0 "+(frac*100)+"%"; panePro.style.flex="1 1 auto";
-});
+divider.addEventListener("pointermove", e => { if(!divDrag)return; const r=split.getBoundingClientRect(); const frac=Math.max(0.2,Math.min(0.8,(e.clientX-r.left)/r.width)); paneLive.style.flex="0 0 "+(frac*100)+"%"; panePro.style.flex="1 1 auto"; });
 divider.addEventListener("pointerup", () => { divDrag=false; });
 
-// ---- Settings row ----------------------------------------------------------
+// ---- Settings ------------------------------------------------------------
 $("adv-btn").onclick = () => $("adv").classList.toggle("show");
 $("model").onchange = async e => { modelKey=e.target.value; landmarker=null; modelLoading=null; try{ await ensureModel(); }catch(_){} };
-// On iPad / iPhone default to the fast model so live tracking keeps up.
-const isMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-if(isMobile){ modelKey = "lite"; $("model").value = "lite"; }
-$("mirror-pose").onchange = e => { mirrorPose=e.target.checked; if(proFrames.length) modelStatus.textContent="Mirror-pose changed. Click Analyse pro again."; };
+const isMobile = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform==="MacIntel" && navigator.maxTouchPoints>1);
+if(isMobile){ modelKey="lite"; $("model").value="lite"; }
+$("mirror-pose").onchange = e => { mirrorPose=e.target.checked; if(proFrames.length) modelStatus.textContent="Mirror-pose changed. Analyse the clip again."; };
 $("auto-reanchor").onchange = e => { autoReanchor=e.target.checked; };
 $("overlays").onchange = e => { showOverlays=e.target.checked; if(!showOverlays){ clearCanvas(liveCanvas); clearCanvas(proCanvas); } };
 const wndR=$("window"), smR=$("smooth"), mcR=$("minconf");
-wndR.oninput = () => { WINDOW=+wndR.value; $("window-v").textContent=WINDOW; };
-smR.oninput = () => { SMOOTH=+smR.value/100; $("smooth-v").textContent=SMOOTH.toFixed(2); };
-mcR.oninput = () => { MINCONF=+mcR.value/100; $("minconf-v").textContent=MINCONF.toFixed(2); };
+wndR.oninput=()=>{ WINDOW=+wndR.value; $("window-v").textContent=WINDOW; };
+smR.oninput=()=>{ SMOOTH=+smR.value/100; $("smooth-v").textContent=SMOOTH.toFixed(2); };
+mcR.oninput=()=>{ MINCONF=+mcR.value/100; $("minconf-v").textContent=MINCONF.toFixed(2); };
 
-// ---- Help ------------------------------------------------------------------
+// ---- Help ----------------------------------------------------------------
 $("help-btn").onclick = () => $("help").classList.toggle("show");
 $("help-close").onclick = () => $("help").classList.remove("show");
 
-render();
-showQuality(null);
+// ---- Library (IndexedDB) -------------------------------------------------
+let db = null;
+function openDB(){
+  return new Promise((resolve,reject) => {
+    const req = indexedDB.open("swing-mirror", 1);
+    req.onupgradeneeded = () => { const d=req.result; if(!d.objectStoreNames.contains("clips")) d.createObjectStore("clips", { keyPath:"id" }); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function dbAll(){
+  if(!db) db = await openDB();
+  return new Promise((resolve,reject) => {
+    const tx=db.transaction("clips","readonly").objectStore("clips").getAll();
+    tx.onsuccess=()=>resolve(tx.result||[]); tx.onerror=()=>reject(tx.error);
+  });
+}
+async function dbGet(id){
+  if(!db) db = await openDB();
+  return new Promise((resolve,reject) => {
+    const tx=db.transaction("clips","readonly").objectStore("clips").get(id);
+    tx.onsuccess=()=>resolve(tx.result); tx.onerror=()=>reject(tx.error);
+  });
+}
+async function dbPut(rec){
+  if(!db) db = await openDB();
+  return new Promise((resolve,reject) => {
+    const tx=db.transaction("clips","readwrite").objectStore("clips").put(rec);
+    tx.onsuccess=()=>resolve(); tx.onerror=()=>reject(tx.error);
+  });
+}
+async function dbDel(id){
+  if(!db) db = await openDB();
+  return new Promise((resolve,reject) => {
+    const tx=db.transaction("clips","readwrite").objectStore("clips").delete(id);
+    tx.onsuccess=()=>resolve(); tx.onerror=()=>reject(tx.error);
+  });
+}
+if(navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(()=>{});
+
+$("library").onclick = async () => { await refreshLibrary(); $("lib").classList.add("show"); };
+$("lib-close").onclick = () => $("lib").classList.remove("show");
+
+$("save-clip").onclick = async () => {
+  if(proFrames.length < 2 || !currentBlob){ return; }
+  const club=$("save-club").value, view=$("save-view").value, note=$("save-note").value.trim();
+  const rec = {
+    id: "clip_" + Date.now() + "_" + Math.round(Math.random()*1e6),
+    club, view, note, fps: fps(), trimIn, trimOut,
+    featVersion: FEAT_VERSION, createdAt: Date.now(),
+    blob: currentBlob,
+    frames: proFrames.map(f => ({ t:f.t, V:f.V, W:f.W, lm:f.lm }))
+  };
+  try {
+    await dbPut(rec);
+    proTag.textContent = club + " / " + view + (note?" ("+note+")":"");
+    clipStatus.textContent = "Saved to library: " + proTag.textContent;
+    $("save-note").value = "";
+    await refreshLibrary();
+  } catch(err){
+    clipStatus.textContent = "Could not save (storage may be full): " + (err && err.message ? err.message : err);
+  }
+};
+
+async function refreshLibrary(){
+  let items = [];
+  try { items = await dbAll(); } catch(e){}
+  const list = $("lib-list");
+  if(!items.length){ list.innerHTML = '<span class="empty">No clips saved yet.</span>'; return; }
+  // group by view then club
+  items.sort((a,b) => (a.view+a.club).localeCompare(b.view+b.club));
+  const groups = {};
+  for(const it of items){ (groups[it.view] = groups[it.view] || []).push(it); }
+  list.innerHTML = "";
+  for(const view of Object.keys(groups)){
+    const gt=document.createElement("div"); gt.className="libgroup-title"; gt.textContent=view; list.appendChild(gt);
+    for(const it of groups[view]){
+      const row=document.createElement("div"); row.className="libitem";
+      const nm=document.createElement("div"); nm.className="name";
+      nm.innerHTML = "<b>"+esc(it.club)+"</b>" + (it.note?" <span class='meta'>"+esc(it.note)+"</span>":"") +
+        "<br><span class='meta'>"+ (it.frames?it.frames.length:0) +" poses" +
+        (it.featVersion!==FEAT_VERSION ? " - needs re-analysing" : "") + "</span>";
+      const loadb=document.createElement("button"); loadb.textContent="Load"; loadb.className="primary";
+      loadb.onclick = () => loadFromLibrary(it.id);
+      const delb=document.createElement("button"); delb.textContent="Delete"; delb.className="del";
+      delb.onclick = async () => { await dbDel(it.id); await refreshLibrary(); };
+      row.appendChild(nm); row.appendChild(loadb); row.appendChild(delb);
+      list.appendChild(row);
+    }
+  }
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function loadFromLibrary(id){
+  const e = await dbGet(id); if(!e) return;
+  pendingLibrary = e;
+  currentBlob = e.blob;
+  pro.src = URL.createObjectURL(e.blob);
+  $("lib").classList.remove("show");
+}
+
+render(); showQuality(null);
 </script>
 </body>
 </html>
